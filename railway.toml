@@ -7,6 +7,6 @@ builder = "NIXPACKS"
 
 [deploy]
 startCommand = "python score_picks.py"
-cronSchedule = "0 8 * * *"   # 8:00 AM UTC every day
+cronSchedule = "0 12 * * *"   # 8:00 AM UTC every day
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
