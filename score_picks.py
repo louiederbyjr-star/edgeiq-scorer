@@ -1237,7 +1237,7 @@ def fetch_and_score():
     # read existing picks — store prev_confidence AND keep graded picks
     existing = sb_select("picks", {
         "pick_date": f"eq.{pick_date}",
-        "select":    "id,pick_line,confidence,result,rank",
+        "select":    "id,pick_line,confidence,result,rank,game_time",
     })
     prev_conf = {row["pick_line"]: row["confidence"] for row in existing if row.get("pick_line")}
 
