@@ -551,7 +551,7 @@ def get_steam_signal(game_id, team, today):
         })
 
         if len(rows) < 3:
-            return 0.5  # not enough snapshots yet
+            return 0.5  # not enough snapshots yet — need 3+ hourly snapshots
 
         def implied(odds):
             odds = int(odds) if odds else 0
@@ -603,17 +603,23 @@ def get_book_disagree_signal(juice_list):
     if len(juice_list) < 3:
         return 0.5  # not enough books to measure disagreement
 
-    mean = sum(juice_list) / len(juice_list)
-    variance = sum((x - mean) ** 2 for x in juice_list) / len(juice_list)
+    # convert to implied probability first — avoids American odds scale distortion
+    def imp(odds):
+        odds = int(odds)
+        if odds > 0: return 100 / (odds + 100)
+        return abs(odds) / (abs(odds) + 100)
+
+    probs = [imp(j) for j in juice_list]
+    mean  = sum(probs) / len(probs)
+    variance = sum((p - mean) ** 2 for p in probs) / len(probs)
     std_dev = variance ** 0.5
 
-    # typical std dev on a settled line is 2-5 points
-    # high disagreement is 10+ points
-    if std_dev >= 15:    return 0.9
-    elif std_dev >= 10:  return 0.75
-    elif std_dev >= 7:   return 0.6
-    elif std_dev >= 4:   return 0.52
-    else:                return 0.45  # books agree — less edge
+    # std dev on implied probs: 0.01 = tight, 0.03 = notable, 0.05+ = big disagreement
+    if std_dev >= 0.05:   return 0.85
+    elif std_dev >= 0.03: return 0.70
+    elif std_dev >= 0.02: return 0.58
+    elif std_dev >= 0.01: return 0.52
+    else:                 return 0.45  # books agree
 
 
 # ── Rest days signal ──────────────────────────────────────────────────
@@ -998,8 +1004,8 @@ def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_c
         line_move_signal = real_line_movement_signal(game_id, team, avg_juice, opening_lines)
 
         fade_signal = 0.0
-        if other_juice < -160:
-            fade_signal = min((abs(other_juice) - 160) / 200, 0.7)  # cap at 0.7
+        if other_juice < -200:
+            fade_signal = min((abs(other_juice) - 200) / 250, 0.6)  # only very heavy chalk
 
         # juice value = vig efficiency, symmetric for fav and dog
         # scaled tightly so it acts as a tiebreaker not a driver
@@ -1095,6 +1101,19 @@ def fetch_and_score():
     props_cache   = {}
     injury_cache  = {}   # filled per-sport below
     rest_cache    = {}   # (team, sport) -> rest signal
+
+    # clear odds cache so game IDs match snapshot table
+    # props, ESPN, rest caches are kept since they don't change intraday
+    import glob
+    cleared = 0
+    for pattern in [f"odds_*_{today}.json", f"totals_*_{today}.json"]:
+        for f in glob.glob(str(CACHE_DIR / pattern)):
+            try:
+                Path(f).unlink()
+                cleared += 1
+            except Exception:
+                pass
+    print(f"  Cleared {cleared} odds cache files for fresh game IDs")
 
     print("Loading opening lines from snapshots...")
     opening_lines = get_opening_lines(today)
