@@ -1102,6 +1102,30 @@ def fetch_and_score():
     injury_cache  = {}   # filled per-sport below
     rest_cache    = {}   # (team, sport) -> rest signal
 
+    # ── determine run mode based on ET time ──────────────────
+    # ET = UTC - 4 (EDT) / UTC - 5 (EST). Use UTC-4 as safe default.
+    from datetime import timedelta as _tdt
+    et_hour = (datetime.now(timezone.utc) - _tdt(hours=4)).hour
+
+    if et_hour < 12:        # before noon ET → 8 AM run
+        run_mode     = "morning"
+        window_start = datetime.now(timezone.utc)
+        window_end   = datetime.now(timezone.utc).replace(hour=23, minute=59, second=59)
+        window_label = "today's upcoming games only"
+    elif et_hour < 20:      # noon–8 PM ET → 3 PM run
+        run_mode     = "afternoon"
+        window_start = datetime.now(timezone.utc)
+        window_end   = datetime.now(timezone.utc).replace(hour=23, minute=59, second=59)
+        window_label = "today's remaining games"
+    else:                   # after 8 PM ET → 8 PM run
+        run_mode     = "evening"
+        tomorrow     = (datetime.now(timezone.utc) + _tdt(days=1)).date()
+        window_start = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 0, 0, 0, tzinfo=timezone.utc)
+        window_end   = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 23, 59, 59, tzinfo=timezone.utc)
+        window_label = "tomorrow's full slate"
+
+    print(f"Run mode: {run_mode} | Window: {window_label}")
+
     # clear odds cache so game IDs match snapshot table
     # props, ESPN, rest caches are kept since they don't change intraday
     import glob
@@ -1162,11 +1186,37 @@ def fetch_and_score():
         # fetch ESPN injuries for this sport
         injuries = get_espn_injuries(sport)
 
+        # ── three-run schedule (all times ET = UTC-4) ──────────────
+        # RUN_MODE is set once per session at top of fetch_and_score()
+        # 8 AM run:  today's games not yet started
+        # 3 PM run:  today's games not yet started (replaces in-progress picks)
+        # 8 PM run:  tomorrow's full slate only
+
+        from datetime import timedelta as _td
+
+        def parse_game_time(game):
+            ct = game.get("commence_time", "")
+            if not ct: return None
+            try:
+                return datetime.fromisoformat(ct.replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+        def in_window(game):
+            gt = parse_game_time(game)
+            if gt is None: return False
+            return window_start <= gt <= window_end
+
+        games_filtered = [g for g in games if in_window(g)]
+        print(f"  {len(games_filtered)}/{len(games)} games in window ({window_label})")
+        games = games_filtered
+
         # build totals lookup by game_id
         totals_by_id = {}
         if totals_games:
             for tg in totals_games:
-                totals_by_id[tg["id"]] = tg
+                if in_window(tg):
+                    totals_by_id[tg["id"]] = tg
 
         for game in games:
             all_picks.extend(score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_cache, today))
@@ -1181,22 +1231,47 @@ def fetch_and_score():
     all_picks.sort(key=lambda p: p["ev"], reverse=True)
     top_picks = all_picks[:MAX_PICKS]
 
-    print(f"\nWriting top {len(top_picks)} picks to Supabase for {today}...")
+    # pick_date and merge strategy depend on run mode
+    if run_mode == "evening":
+        from datetime import timedelta as _td2
+        pick_date = (datetime.now(timezone.utc) + _td2(days=1)).date().isoformat()
+    else:
+        pick_date = today
 
-    # read existing picks before deleting — store prev_confidence for trend arrows
+    print(f"\nWriting top {len(top_picks)} picks to Supabase for {pick_date} [{run_mode} run]...")
+
+    # read existing picks — store prev_confidence AND keep graded picks
     existing = sb_select("picks", {
-        "pick_date": f"eq.{today}",
-        "select":    "pick_line,confidence",
+        "pick_date": f"eq.{pick_date}",
+        "select":    "id,pick_line,confidence,result,rank",
     })
     prev_conf = {row["pick_line"]: row["confidence"] for row in existing if row.get("pick_line")}
 
-    sb_delete("picks", {"pick_date": f"eq.{today}"})
+    if run_mode == "afternoon":
+        # 3 PM run: keep graded/in-progress picks, only replace ungraded ones
+        # build set of pick_lines in new top picks
+        new_pick_lines = {p["pick_line"] for p in top_picks}
+        # delete only ungraded existing picks (result is null)
+        for row in existing:
+            if row.get("result") is None:
+                sb_delete("picks", {"id": f"eq.{row['id']}"})
+        # fill remaining slots up to MAX_PICKS
+        graded_existing = [r for r in existing if r.get("result") is not None]
+        slots_available = MAX_PICKS - len(graded_existing)
+        # filter top_picks to exclude lines already graded
+        graded_lines = {r["pick_line"] for r in graded_existing}
+        new_top = [p for p in top_picks if p["pick_line"] not in graded_lines]
+        top_picks = new_top[:slots_available]
+        print(f"  {len(graded_existing)} graded picks kept, adding {len(top_picks)} new picks")
+    else:
+        # 8 AM and 8 PM runs: full replace
+        sb_delete("picks", {"pick_date": f"eq.{pick_date}"})
 
     for rank, pick in enumerate(top_picks, 1):
         prev = prev_conf.get(pick["pick_line"])
         record = {
             **pick,
-            "pick_date":       today,
+            "pick_date":       pick_date,
             "rank":            rank,
             "result":          None,
             "prev_confidence": prev,  # None on first run, float on rescore
