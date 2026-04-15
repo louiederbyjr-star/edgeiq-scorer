@@ -632,8 +632,8 @@ _rest_cache = {}
 def get_rest_days(team, sport):
     """
     Fetch days of rest for a team since their last game.
-    Returns rest days as int, or None if unknown.
-    Uses ESPN scoreboard — free, no API key.
+    Walks back day by day (up to 7 days) until it finds the team.
+    Each day's scoreboard is cached separately.
     """
     cache_key = f"rest_{sport}_{team}"
     cached = cache_get(cache_key)
@@ -650,54 +650,49 @@ def get_rest_days(team, sport):
     if not sport_path:
         return None
 
+    team_lower    = team.lower()
+    team_nickname = team_lower.split()[-1]  # "angels", "dodgers", etc.
+    today_dt      = datetime.now(timezone.utc).date()
+
     try:
-        # fetch recent scoreboard (last 14 days)
-        from datetime import timedelta
-        today    = datetime.now(timezone.utc).date()
-        from_dt  = (today - timedelta(days=14)).strftime("%Y%m%d")
-        to_dt    = today.strftime("%Y%m%d")
+        from datetime import timedelta, date as date_type
 
-        resp = requests.get(
-            f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/scoreboard",
-            params={"dates": f"{from_dt}-{to_dt}"},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return None
+        for days_back in range(1, 8):
+            check_date    = today_dt - timedelta(days=days_back)
+            check_str     = check_date.strftime("%Y%m%d")
+            day_cache_key = f"espn_sb_{sport}_{check_str}"
 
-        data   = resp.json()
-        events = data.get("events", [])
+            day_events = cache_get(day_cache_key)
+            if day_events is None:
+                resp = requests.get(
+                    f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/scoreboard",
+                    params={"dates": check_str},
+                    timeout=8,
+                )
+                if resp.status_code != 200:
+                    continue
+                day_events = resp.json().get("events", [])
+                cache_set(day_cache_key, day_events)
 
-        team_lower  = team.lower()
-        last_game   = None
+            # look for completed games with this team
+            for event in day_events:
+                status = event.get("status", {}).get("type", {}).get("name", "")
+                if status not in ("STATUS_FINAL", "STATUS_FINAL_OT"):
+                    continue
+                comps = event.get("competitions", [{}])
+                if not comps:
+                    continue
+                for competitor in comps[0].get("competitors", []):
+                    name = competitor.get("team", {}).get("displayName", "").lower()
+                    if team_nickname in name and len(team_nickname) > 3:
+                        rest_days = days_back
+                        print(f"  Rest {team}: last game {check_date} ({rest_days}d ago)")
+                        cache_set(cache_key, rest_days)
+                        return rest_days
 
-        for event in events:
-            status = event.get("status", {}).get("type", {}).get("name", "")
-            if status not in ("STATUS_FINAL", "STATUS_FINAL_OT"):
-                continue
-
-            game_date = event.get("date", "")[:10]  # YYYY-MM-DD
-            comps     = event.get("competitions", [{}])
-            if not comps:
-                continue
-
-            for competitor in comps[0].get("competitors", []):
-                name = competitor.get("team", {}).get("displayName", "").lower()
-                if any(word in name for word in team_lower.split()
-                       if len(word) > 3):
-                    if last_game is None or game_date > last_game:
-                        last_game = game_date
-
-        if not last_game:
-            cache_set(cache_key, None)
-            return None
-
-        from datetime import date
-        last_dt   = date.fromisoformat(last_game)
-        rest_days = (today - last_dt).days
-
-        cache_set(cache_key, rest_days)
-        return rest_days
+        # no game found in last 7 days
+        cache_set(cache_key, None)
+        return None
 
     except Exception as e:
         return None
