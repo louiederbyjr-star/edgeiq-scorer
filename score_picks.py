@@ -959,7 +959,6 @@ def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_c
                 point = outcome.get("point", 0)
                 if -600 <= price <= 600 and price != 0:
                     juices.setdefault(name, []).append(price)
-                    # track best price: highest positive or least negative
                     cur_best = best_price.get(name, -9999)
                     if price > cur_best:
                         best_price[name] = price
@@ -1243,21 +1242,42 @@ def fetch_and_score():
     prev_conf = {row["pick_line"]: row["confidence"] for row in existing if row.get("pick_line")}
 
     if run_mode == "afternoon":
-        # 3 PM run: keep graded/in-progress picks, only replace ungraded ones
-        # build set of pick_lines in new top picks
-        new_pick_lines = {p["pick_line"] for p in top_picks}
-        # delete only ungraded existing picks (result is null)
+        # 3 PM run: keep graded picks AND in-progress games, replace only future ungraded picks
+        now_utc = datetime.now(timezone.utc)
+
+        def game_has_started(row):
+            """Return True if this pick's game has already started or finished."""
+            gt = row.get("game_time", "")
+            if not gt: return False
+            try:
+                game_dt = datetime.fromisoformat(gt.replace("Z", "+00:00"))
+                return game_dt <= now_utc
+            except Exception:
+                return False
+
+        # keep: graded picks + in-progress games (started but no result yet)
+        # delete: ungraded picks whose game hasn't started yet
+        keep_rows   = []
+        delete_rows = []
         for row in existing:
-            if row.get("result") is None:
-                sb_delete("picks", {"id": f"eq.{row['id']}"})
-        # fill remaining slots up to MAX_PICKS
-        graded_existing = [r for r in existing if r.get("result") is not None]
-        slots_available = MAX_PICKS - len(graded_existing)
-        # filter top_picks to exclude lines already graded
-        graded_lines = {r["pick_line"] for r in graded_existing}
-        new_top = [p for p in top_picks if p["pick_line"] not in graded_lines]
-        top_picks = new_top[:slots_available]
-        print(f"  {len(graded_existing)} graded picks kept, adding {len(top_picks)} new picks")
+            if row.get("result") is not None:
+                keep_rows.append(row)    # already graded — always keep
+            elif game_has_started(row):
+                keep_rows.append(row)    # game in progress — keep on board
+            else:
+                delete_rows.append(row)  # future game, ungraded — replace
+
+        for row in delete_rows:
+            sb_delete("picks", {"id": f"eq.{row['id']}"})
+
+        slots_available = MAX_PICKS - len(keep_rows)
+        keep_lines      = {r["pick_line"] for r in keep_rows}
+        new_top         = [p for p in top_picks if p["pick_line"] not in keep_lines]
+        top_picks       = new_top[:max(0, slots_available)]
+
+        in_progress = [r for r in keep_rows if r.get("result") is None]
+        graded      = [r for r in keep_rows if r.get("result") is not None]
+        print(f"  Kept: {len(graded)} graded, {len(in_progress)} in-progress | Adding {len(top_picks)} new picks")
     else:
         # 8 AM and 8 PM runs: full replace
         sb_delete("picks", {"pick_date": f"eq.{pick_date}"})
