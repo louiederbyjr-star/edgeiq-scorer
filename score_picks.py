@@ -1164,7 +1164,19 @@ def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_c
         confidence = round(48 + raw * 20, 1)
         ev         = expected_value(confidence, avg_juice)
 
-        if ev <= 0:
+        # scaled minimum EV threshold — bigger underdogs need more edge
+        # this prevents the model from recommending +300 dogs just because vig is low
+        # favorites need less edge since the implied probability is already high
+        abs_odds = abs(avg_juice)
+        if avg_juice >= 0:
+            # underdog — require more EV as odds get longer
+            # +100 needs EV > 1, +200 needs EV > 3, +300 needs EV > 5
+            min_ev = 1.0 + (avg_juice / 100.0)
+        else:
+            # favorite — standard positive EV is enough
+            min_ev = 0.5
+
+        if ev < min_ev:
             continue
 
         picks.append({
