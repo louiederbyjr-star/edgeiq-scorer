@@ -70,18 +70,19 @@ RUN_LINE_SPORTS = {"baseball_mlb", "icehockey_nhl"}
 MAX_PICKS = 6  # 3 sides + 3 totals
 
 WEIGHTS = {
-    "line_movement":  0.18,
-    "no_vig_edge":    0.15,
-    "reverse_line":   0.12,
-    "steam_move":     0.09,
-    "clv":            0.09,
-    "injury":         0.08,
-    "book_disagree":  0.07,
-    "rest_days":      0.06,
+    "line_movement":  0.16,
+    "no_vig_edge":    0.13,
+    "reverse_line":   0.11,
+    "team_form":      0.13,  # new — team quality filter
+    "steam_move":     0.08,
+    "clv":            0.08,
+    "injury":         0.07,
+    "book_disagree":  0.06,
+    "rest_days":      0.05,
     "weather":        0.05,
-    "prop_signal":    0.05,
+    "prop_signal":    0.04,
     "juice_value":    0.02,
-    "fade_public":    0.04,
+    "fade_public":    0.02,
 }
 
 # ── Supabase helpers ──────────────────────────────────────────────────
@@ -589,6 +590,110 @@ def get_steam_signal(game_id, team, today):
         return 0.5
 
 
+# ── Team form / win rate signal ──────────────────────────────────────
+# Pulls current season win% from ESPN scoreboard.
+# Bad teams (sub .400) get penalized, good teams (.550+) get a boost.
+# This prevents the model from blindly picking terrible teams at good odds.
+
+_team_form_cache = {}
+
+def get_team_form(sport):
+    """
+    Fetch current season records for all teams from ESPN scoreboard.
+    Returns dict: team_name -> win_pct (0.0 - 1.0)
+    """
+    if sport in _team_form_cache:
+        return _team_form_cache[sport]
+
+    ESPN_SPORT_MAP = {
+        "basketball_nba":       "basketball/nba",
+        "americanfootball_nfl": "football/nfl",
+        "baseball_mlb":         "baseball/mlb",
+        "icehockey_nhl":        "hockey/nhl",
+    }
+    sport_path = ESPN_SPORT_MAP.get(sport, "")
+    if not sport_path:
+        return {}
+
+    cache_key = f"team_form_{sport}"
+    cached    = cache_get(cache_key)
+    if cached is not None:
+        _team_form_cache[sport] = cached
+        return cached
+
+    try:
+        resp = requests.get(
+            f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/teams",
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return {}
+
+        data  = resp.json()
+        teams = data.get("sports", [{}])[0].get("leagues", [{}])[0].get("teams", [])
+        form  = {}
+
+        for entry in teams:
+            team = entry.get("team", {})
+            name = team.get("displayName", "")
+            record = team.get("record", {}).get("items", [])
+            if not record:
+                continue
+            # first record item is overall season record
+            stats = record[0].get("stats", [])
+            wins   = next((s["value"] for s in stats if s["name"] == "wins"),   None)
+            losses = next((s["value"] for s in stats if s["name"] == "losses"), None)
+            if wins is not None and losses is not None:
+                total = wins + losses
+                if total > 0:
+                    form[name] = round(wins / total, 3)
+
+        cache_set(cache_key, form)
+        print(f"  Team form {sport}: {len(form)} teams loaded")
+        _team_form_cache[sport] = form
+        return form
+
+    except Exception as e:
+        print(f"  Team form error {sport}: {e}")
+        _team_form_cache[sport] = {}
+        return {}
+
+def get_form_signal(team, sport, team_form):
+    """
+    Convert win% to a 0-1 signal.
+    .550+ = strong team = 0.7-0.85
+    .500  = average     = 0.5
+    .400  = weak team   = 0.3
+    .300- = terrible    = 0.15
+
+    Fuzzy-matches team name by nickname.
+    """
+    if not team_form:
+        return 0.5
+
+    team_nickname = team.lower().split()[-1]
+    win_pct       = None
+
+    for form_name, pct in team_form.items():
+        if team_nickname in form_name.lower():
+            win_pct = pct
+            break
+
+    if win_pct is None:
+        return 0.5  # unknown team = neutral
+
+    # scale win% to signal
+    # centered at .500 = 0.5 signal
+    if win_pct >= 0.600:   signal = 0.85
+    elif win_pct >= 0.550: signal = 0.72
+    elif win_pct >= 0.500: signal = 0.58
+    elif win_pct >= 0.450: signal = 0.45
+    elif win_pct >= 0.400: signal = 0.32
+    else:                  signal = 0.18  # bad team — strong penalty
+
+    return signal
+
+
 # ── Book disagreement signal ─────────────────────────────────────────
 # When books disagree on a line, the market is inefficient — there is
 # value to be found. High disagreement = higher signal for the underdog
@@ -934,7 +1039,7 @@ def expected_value(confidence, odds):
     implied_prob = american_to_implied_prob(odds) * 100
     return round(confidence - implied_prob, 2)
 
-def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_cache, today=""):
+def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_cache, today="", team_form=None):
     picks      = []
     bookmakers = game.get("bookmakers", [])
     if not bookmakers:
@@ -1010,6 +1115,9 @@ def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_c
         # injury signal — lower if key players out for this team
         injury_signal = get_injury_signal(team, sport, injuries)
 
+        # team form — penalize bad teams, reward good teams
+        form_signal = get_form_signal(team, sport, team_form or {})
+
         # book disagreement — high std dev across books = market inefficiency
         book_disagree_signal = get_book_disagree_signal(juices.get(team, []))
 
@@ -1039,18 +1147,19 @@ def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_c
         team_weather = weather_signal if avg_juice > 0 else (1 - weather_signal)
 
         raw = (
-            line_move_signal  * WEIGHTS["line_movement"] +
-            fade_signal       * WEIGHTS["fade_public"]   +
-            juice_signal      * WEIGHTS["juice_value"]   +
-            team_weather      * WEIGHTS["weather"]       +
-            prop_signal       * WEIGHTS["prop_signal"]   +
-            injury_signal     * WEIGHTS["injury"]        +
+            line_move_signal     * WEIGHTS["line_movement"] +
+            fade_signal          * WEIGHTS["fade_public"]   +
+            juice_signal         * WEIGHTS["juice_value"]   +
+            team_weather         * WEIGHTS["weather"]       +
+            prop_signal          * WEIGHTS["prop_signal"]   +
+            injury_signal        * WEIGHTS["injury"]        +
             book_disagree_signal * WEIGHTS["book_disagree"] +
-            rest_signal       * WEIGHTS["rest_days"]     +
-            clv_signal        * WEIGHTS["clv"]           +
-            no_vig_signal     * WEIGHTS["no_vig_edge"]   +
-            reverse_signal    * WEIGHTS["reverse_line"]  +
-            steam_signal      * WEIGHTS["steam_move"]
+            rest_signal          * WEIGHTS["rest_days"]     +
+            clv_signal           * WEIGHTS["clv"]           +
+            no_vig_signal        * WEIGHTS["no_vig_edge"]   +
+            reverse_signal       * WEIGHTS["reverse_line"]  +
+            steam_signal         * WEIGHTS["steam_move"]    +
+            form_signal          * WEIGHTS["team_form"]
         )
         confidence = round(48 + raw * 20, 1)
         ev         = expected_value(confidence, avg_juice)
@@ -1081,6 +1190,7 @@ def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_c
                 "no_vig_edge":   round(no_vig_signal, 3),
                 "reverse_line":  round(reverse_signal, 3),
                 "steam_move":    round(steam_signal, 3),
+                "team_form":     round(form_signal, 3),
             },
             "num_books":  len(bookmakers),
         })
@@ -1179,8 +1289,9 @@ def fetch_and_score():
             continue
         print(f"  {len(games)} games found")
 
-        # fetch ESPN injuries for this sport
-        injuries = get_espn_injuries(sport)
+        # fetch ESPN injuries and team form for this sport
+        injuries  = get_espn_injuries(sport)
+        team_form = get_team_form(sport)
 
         # ── three-run schedule (all times ET = UTC-4) ──────────────
         # RUN_MODE is set once per session at top of fetch_and_score()
@@ -1215,7 +1326,7 @@ def fetch_and_score():
                     totals_by_id[tg["id"]] = tg
 
         for game in games:
-            all_picks.extend(score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_cache, today))
+            all_picks.extend(score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_cache, today, team_form))
             # score totals if available for this game
             if game["id"] in totals_by_id:
                 all_picks.extend(score_totals(totals_by_id[game["id"]], opening_lines, weather_cache))
@@ -1312,6 +1423,7 @@ def fetch_and_score():
             "no_vig_edge":   "no-vig edge",
             "reverse_line":  "reverse line move",
             "steam_move":    "steam move detected",
+            "team_form":     "team quality",
         }
         print(f"  #{rank}  {pick['pick_line']:<35} conf {pick['confidence']}%  EV {pick['ev']:+.1f}  [{labels.get(driver, driver)}]")
 
