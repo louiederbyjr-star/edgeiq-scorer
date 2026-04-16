@@ -1050,8 +1050,11 @@ def score_totals(game, opening_lines, weather_cache):
             clv_signal           * 0.10
         )
 
-        confidence = round(48 + raw * 20, 1)
-        ev         = expected_value(confidence, avg_juice)
+        # totals: use 50/50 base (over/under is symmetric)
+        totals_adj  = signal_to_adjustment(raw)
+        adj_prob    = min(0.95, max(0.05, 0.5 + totals_adj))
+        confidence  = round(adj_prob * 100, 1)
+        ev          = expected_value(adj_prob, avg_juice)
 
         if ev <= 0:
             continue
@@ -1067,6 +1070,7 @@ def score_totals(game, opening_lines, weather_cache):
             "odds":       int(avg_juice),
             "confidence": confidence,
             "ev":         ev,
+            "raw_score":  round(raw, 4),
             "game_time":  game["commence_time"],
             "pick_type":  "total",
             "signals": {
@@ -1131,11 +1135,46 @@ def american_to_implied_prob(odds):
     if odds > 0:  return 100 / (odds + 100)
     return abs(odds) / (abs(odds) + 100)
 
-def expected_value(confidence, odds):
-    odds = int(odds)
-    if odds == 0: return 0
-    implied_prob = american_to_implied_prob(odds) * 100
-    return round(confidence - implied_prob, 2)
+def no_vig_prob(team_odds, other_odds):
+    """Remove bookmaker margin to get true market probability."""
+    p1 = american_to_implied_prob(team_odds)
+    # if other_odds is 0 or missing, use complement (avoids distortion)
+    if not other_odds or other_odds == 0:
+        return p1  # use raw implied prob as best estimate
+    p2    = american_to_implied_prob(other_odds)
+    total = p1 + p2
+    if total == 0: return 0.5
+    return p1 / total
+
+def signal_to_adjustment(raw_score):
+    """
+    Convert raw signal score (0-1) to a probability adjustment.
+    Centered at 0.5 = no adjustment.
+    Max ±10% adjustment — keeps estimates anchored to the market.
+    A raw score of 0.65 = +3% boost.
+    A raw score of 0.80 = +6% boost.
+    """
+    deviation = raw_score - 0.5
+    return deviation * 0.20
+
+def adjusted_confidence(raw_score, team_odds, other_odds):
+    """
+    Calculate adjusted win probability anchored to market price.
+    This is the model's estimate of the true win probability.
+    """
+    nv_prob = no_vig_prob(team_odds, other_odds)
+    adj     = signal_to_adjustment(raw_score)
+    return min(0.95, max(0.05, nv_prob + adj))
+
+def expected_value(adj_prob, best_odds):
+    """
+    EV = adjusted probability - implied probability at best available odds.
+    Positive EV means we think the team wins more often than the odds imply.
+    """
+    best_odds = int(best_odds)
+    if best_odds == 0: return 0
+    implied = american_to_implied_prob(best_odds)
+    return round((adj_prob - implied) * 100, 2)
 
 def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_cache, today="", team_form=None):
     picks      = []
@@ -1259,23 +1298,15 @@ def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_c
             steam_signal         * WEIGHTS["steam_move"]    +
             form_signal          * WEIGHTS["team_form"]
         )
-        confidence = round(48 + raw * 20, 1)
-        ev         = expected_value(confidence, avg_juice)
+        # confidence = market-anchored adjusted probability
+        adj_prob   = adjusted_confidence(raw, avg_juice, other_juice)
+        confidence = round(adj_prob * 100, 1)
+        ev         = expected_value(adj_prob, avg_juice)
 
-        # scaled minimum EV threshold — bigger underdogs need more edge
-        # this prevents the model from recommending +300 dogs just because vig is low
-        # favorites need less edge since the implied probability is already high
-        abs_odds = abs(avg_juice)
-        if avg_juice >= 0:
-            # underdog — require more EV as odds get longer
-            # +100 needs EV > 1, +200 needs EV > 3, +300 needs EV > 5
-            min_ev = 1.0 + (avg_juice / 100.0)
-        else:
-            # favorite — standard positive EV is enough
-            min_ev = 0.5
-
-        if ev < min_ev:
-            continue
+        # no minimum EV filter — show best available picks ranked by EV
+        # the EV number is now honest so users can judge quality themselves
+        # on weak signal days EV will be negative — that's the correct answer
+        pass  # all picks proceed, sorted by EV descending
 
         picks.append({
             "sport":      sport,
@@ -1286,6 +1317,7 @@ def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_c
             "odds":       int(avg_juice),
             "confidence": confidence,
             "ev":         ev,
+            "raw_score":  round(raw, 4),
             "game_time":  game["commence_time"],
             "signals": {
                 "line_movement": round(line_move_signal, 3),
