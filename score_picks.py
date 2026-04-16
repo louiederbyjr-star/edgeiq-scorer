@@ -59,6 +59,9 @@ SPORTS = [
     "americanfootball_nfl",
     "baseball_mlb",
     "icehockey_nhl",
+    "soccer_usa_mls",          # MLS — in season Apr-Nov
+    "basketball_ncaab",        # NCAAB — in season Nov-Apr
+    "americanfootball_ncaaf",  # NCAAF — in season Aug-Jan
 ]
 
 # sports played outdoors where weather matters
@@ -67,7 +70,7 @@ OUTDOOR_SPORTS = {"americanfootball_nfl", "baseball_mlb"}
 # sports where run line / puck line corrupts spread data
 RUN_LINE_SPORTS = {"baseball_mlb", "icehockey_nhl"}
 
-MAX_PICKS = 6  # 3 sides + 3 totals
+MAX_PICKS = 6  # top 6 across all sports
 
 WEIGHTS = {
     "line_movement":  0.16,
@@ -246,7 +249,8 @@ def get_props_signal(sport, game_id):
     Returns 0.5 (neutral) if no props available.
     """
     # only fetch props for sports where they're meaningful
-    if sport not in ("basketball_nba", "americanfootball_nfl", "baseball_mlb"):
+    if sport not in ("basketball_nba", "americanfootball_nfl", "baseball_mlb",
+                      "basketball_ncaab", "americanfootball_ncaaf"):
         return 0.5
 
     prop_markets = {
@@ -599,17 +603,22 @@ _team_form_cache = {}
 
 def get_team_form(sport):
     """
-    Fetch current season records for all teams from ESPN scoreboard.
+    Fetch current season records from ESPN scoreboard competitor data.
+    The scoreboard embeds records in each game — we scan recent days
+    to collect records for as many teams as possible.
     Returns dict: team_name -> win_pct (0.0 - 1.0)
     """
     if sport in _team_form_cache:
         return _team_form_cache[sport]
 
     ESPN_SPORT_MAP = {
-        "basketball_nba":       "basketball/nba",
-        "americanfootball_nfl": "football/nfl",
-        "baseball_mlb":         "baseball/mlb",
-        "icehockey_nhl":        "hockey/nhl",
+        "basketball_nba":          "basketball/nba",
+        "americanfootball_nfl":    "football/nfl",
+        "baseball_mlb":            "baseball/mlb",
+        "icehockey_nhl":           "hockey/nhl",
+        "soccer_usa_mls":          "soccer/usa.1",
+        "basketball_ncaab":        "basketball/mens-college-basketball",
+        "americanfootball_ncaaf":  "football/college-football",
     }
     sport_path = ESPN_SPORT_MAP.get(sport, "")
     if not sport_path:
@@ -622,31 +631,73 @@ def get_team_form(sport):
         return cached
 
     try:
-        resp = requests.get(
-            f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/teams",
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return {}
+        from datetime import timedelta
+        form      = {}
+        today_dt  = datetime.now(timezone.utc).date()
 
-        data  = resp.json()
-        teams = data.get("sports", [{}])[0].get("leagues", [{}])[0].get("teams", [])
-        form  = {}
-
-        for entry in teams:
-            team = entry.get("team", {})
-            name = team.get("displayName", "")
-            record = team.get("record", {}).get("items", [])
-            if not record:
+        # scan last 3 days of scoreboards to collect team records
+        for days_back in range(0, 4):
+            check_date = (today_dt - timedelta(days=days_back)).strftime("%Y%m%d")
+            resp = requests.get(
+                f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/scoreboard",
+                params={"dates": check_date},
+                timeout=8,
+            )
+            if resp.status_code != 200:
                 continue
-            # first record item is overall season record
-            stats = record[0].get("stats", [])
-            wins   = next((s["value"] for s in stats if s["name"] == "wins"),   None)
-            losses = next((s["value"] for s in stats if s["name"] == "losses"), None)
-            if wins is not None and losses is not None:
-                total = wins + losses
-                if total > 0:
-                    form[name] = round(wins / total, 3)
+
+            events = resp.json().get("events", [])
+            for event in events:
+                comps = (event.get("competitions") or [{}])[0]
+                for competitor in comps.get("competitors", []):
+                    name    = competitor.get("team", {}).get("displayName", "")
+                    records = competitor.get("records", [])
+                    if not name or not records:
+                        continue
+                    # find overall record — summary like "8-6"
+                    overall = next((r for r in records if r.get("name") == "overall"), None)
+                    if not overall:
+                        overall = records[0]
+                    summary = overall.get("summary", "")  # e.g. "8-6" or "8-6-1"
+                    if summary and "-" in summary:
+                        parts = summary.split("-")
+                        try:
+                            w = int(parts[0])
+                            l = int(parts[1])
+                            total = w + l
+                            if total > 0 and name not in form:
+                                form[name] = round(w / total, 3)
+                        except (ValueError, IndexError):
+                            pass
+
+
+
+            # assign points/runs/goals allowed using same event loop
+            SCORE_SPORTS = {"baseball_mlb", "basketball_nba", "icehockey_nhl", "americanfootball_nfl"}
+            if sport in SCORE_SPORTS:
+                for event in events:
+                    status2 = event.get("status", {}).get("type", {}).get("name", "")
+                    if status2 not in ("STATUS_FINAL", "STATUS_FINAL_OT"):
+                        continue
+                    comps2 = (event.get("competitions") or [{}])[0]
+                    competitors2 = comps2.get("competitors", [])
+                    if len(competitors2) == 2:
+                        name0  = competitors2[0].get("team", {}).get("displayName", "")
+                        name1  = competitors2[1].get("team", {}).get("displayName", "")
+                        score0 = competitors2[0].get("score", "0")
+                        score1 = competitors2[1].get("score", "0")
+                        try:
+                            r0 = int(score0)
+                            r1 = int(score1)
+                            form[f"{name0}__rs"] = form.get(f"{name0}__rs", 0) + r0
+                            form[f"{name1}__rs"] = form.get(f"{name1}__rs", 0) + r1
+                            form[f"{name0}__ra"] = form.get(f"{name0}__ra", 0) + r1
+                            form[f"{name1}__ra"] = form.get(f"{name1}__ra", 0) + r0
+                        except (ValueError, TypeError):
+                            pass
+
+            if len(form) >= 20:  # enough teams found
+                break
 
         cache_set(cache_key, form)
         print(f"  Team form {sport}: {len(form)} teams loaded")
@@ -660,30 +711,74 @@ def get_team_form(sport):
 
 def get_form_signal(team, sport, team_form):
     """
-    Convert win% to a 0-1 signal.
-    .550+ = strong team = 0.7-0.85
-    .500  = average     = 0.5
-    .400  = weak team   = 0.3
-    .300- = terrible    = 0.15
-
-    Fuzzy-matches team name by nickname.
+    Convert team quality to a 0-1 signal.
+    For MLB: uses Pythagorean expectation (RS²/(RS²+RA²)) which is
+    more predictive than W-L record as it filters out luck in close games.
+    For other sports: uses actual win%.
     """
     if not team_form:
         return 0.5
 
     team_nickname = team.lower().split()[-1]
+    matched_name  = None
     win_pct       = None
 
-    for form_name, pct in team_form.items():
+    for form_name, val in team_form.items():
+        if "__" in form_name:
+            continue  # skip RS/RA helper keys
         if team_nickname in form_name.lower():
-            win_pct = pct
+            matched_name = form_name
+            win_pct      = val
             break
 
     if win_pct is None:
-        return 0.5  # unknown team = neutral
+        return 0.5
 
-    # scale win% to signal
-    # centered at .500 = 0.5 signal
+    # adjust win% using score differential data
+    if matched_name:
+        rs = team_form.get(f"{matched_name}__rs", 0)
+        ra = team_form.get(f"{matched_name}__ra", 0)
+
+        if rs > 0 and ra > 0:
+            if sport == "baseball_mlb":
+                # Pythagorean expectation: RS²/(RS²+RA²)
+                # most predictive formula for baseball
+                pyth_exp = (rs ** 2) / (rs ** 2 + ra ** 2)
+                win_pct  = round(0.6 * pyth_exp + 0.4 * win_pct, 3)
+
+            elif sport == "basketball_nba":
+                # point differential per game — NBA is highly correlated with quality
+                # typical range: elite teams +8 to +12, bad teams -8 to -12
+                games   = max(1, rs + ra)  # rough game count proxy
+                avg_rs  = rs / max(1, team_form.get("__games__", rs / 100))
+                avg_ra  = ra / max(1, team_form.get("__games__", ra / 100))
+                # simpler: use ratio like Pythagorean
+                pyth_nba = (rs ** 13.91) / (rs ** 13.91 + ra ** 13.91)  # Pythagorean exponent for NBA
+                win_pct  = round(0.6 * pyth_nba + 0.4 * win_pct, 3)
+
+            elif sport == "icehockey_nhl":
+                # goal differential — use Pythagorean with NHL exponent (~2.15)
+                pyth_nhl = (rs ** 2.15) / (rs ** 2.15 + ra ** 2.15)
+                win_pct  = round(0.6 * pyth_nhl + 0.4 * win_pct, 3)
+
+            elif sport == "americanfootball_nfl":
+                # NFL Pythagorean exponent ~2.37
+                pyth_nfl = (rs ** 2.37) / (rs ** 2.37 + ra ** 2.37)
+                win_pct  = round(0.6 * pyth_nfl + 0.4 * win_pct, 3)
+
+            elif sport == "soccer_usa_mls":
+                # Soccer Pythagorean exponent ~1.35 (low scoring, more variance)
+                if rs + ra > 0:
+                    pyth_mls = (rs ** 1.35) / (rs ** 1.35 + ra ** 1.35)
+                    win_pct  = round(0.6 * pyth_mls + 0.4 * win_pct, 3)
+
+            elif sport in ("basketball_ncaab", "americanfootball_ncaaf"):
+                # College sports — same exponents as pro
+                exp = 13.91 if "basketball" in sport else 2.37
+                pyth_col = (rs ** exp) / (rs ** exp + ra ** exp)
+                win_pct  = round(0.6 * pyth_col + 0.4 * win_pct, 3)
+
+    # scale win% to 0-1 signal centered at .500
     if win_pct >= 0.600:   signal = 0.85
     elif win_pct >= 0.550: signal = 0.72
     elif win_pct >= 0.500: signal = 0.58
@@ -746,17 +841,20 @@ def get_rest_days(team, sport):
         return cached
 
     ESPN_SPORT_MAP = {
-        "basketball_nba":       "basketball/nba",
-        "americanfootball_nfl": "football/nfl",
-        "baseball_mlb":         "baseball/mlb",
-        "icehockey_nhl":        "hockey/nhl",
+        "basketball_nba":          "basketball/nba",
+        "americanfootball_nfl":    "football/nfl",
+        "baseball_mlb":            "baseball/mlb",
+        "icehockey_nhl":           "hockey/nhl",
+        "soccer_usa_mls":          "soccer/usa.1",
+        "basketball_ncaab":        "basketball/mens-college-basketball",
+        "americanfootball_ncaaf":  "football/college-football",
     }
     sport_path = ESPN_SPORT_MAP.get(sport, "")
     if not sport_path:
         return None
 
     team_lower    = team.lower()
-    team_nickname = team_lower.split()[-1]  # "angels", "dodgers", etc.
+    team_nickname = team_lower.split()[-1]
     today_dt      = datetime.now(timezone.utc).date()
 
     try:
