@@ -1113,7 +1113,9 @@ def fetch_and_score():
         window_label = "today's remaining games"
     else:                   # after 8 PM ET → 8 PM run
         run_mode     = "evening"
-        tomorrow     = (datetime.now(timezone.utc) + _tdt(days=1)).date()
+        # use ET date as base — at midnight UTC it's still "yesterday" in ET
+        et_now       = datetime.now(timezone.utc) - _tdt(hours=4)
+        tomorrow     = (et_now + _tdt(days=1)).date()
         window_start = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 0, 0, 0, tzinfo=timezone.utc)
         window_end   = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 23, 59, 59, tzinfo=timezone.utc)
         window_label = "tomorrow's full slate"
@@ -1228,7 +1230,9 @@ def fetch_and_score():
     # pick_date and merge strategy depend on run mode
     if run_mode == "evening":
         from datetime import timedelta as _td2
-        pick_date = (datetime.now(timezone.utc) + _td2(days=1)).date().isoformat()
+        # use ET date base so midnight UTC doesn't add an extra day
+        et_now_for_date = datetime.now(timezone.utc) - _td2(hours=4)
+        pick_date = (et_now_for_date + _td2(days=1)).date().isoformat()
     else:
         pick_date = today
 
