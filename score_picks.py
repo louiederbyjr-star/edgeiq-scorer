@@ -73,19 +73,20 @@ RUN_LINE_SPORTS = {"baseball_mlb", "icehockey_nhl"}
 MAX_PICKS = 6  # top 6 across all sports
 
 WEIGHTS = {
-    "line_movement":  0.16,
-    "no_vig_edge":    0.13,
-    "reverse_line":   0.11,
-    "team_form":      0.13,  # new — team quality filter
+    "team_form":      0.20,  # increased — 51% win rate, best signal
+    "line_movement":  0.08,  # reduced — 35% win rate when driving, hurting us
+    "no_vig_edge":    0.10,
+    "reverse_line":   0.10,
     "steam_move":     0.08,
     "clv":            0.08,
-    "injury":         0.07,
+    "injury":         0.06,
+    "rotowire":       0.06,
     "book_disagree":  0.06,
-    "rest_days":      0.05,
+    "rest_days":      0.06,
     "weather":        0.05,
     "prop_signal":    0.04,
     "juice_value":    0.02,
-    "fade_public":    0.02,
+    "fade_public":    0.01,
 }
 
 # ── Supabase helpers ──────────────────────────────────────────────────
@@ -320,6 +321,150 @@ def get_props_signal(sport, game_id):
     except Exception as e:
         print(f"  Props error: {e}")
         return 0.5
+
+# ── RotoWire injury signal ───────────────────────────────────────────
+# RotoWire publishes free RSS feeds with player news and injury updates.
+# Often faster than ESPN for breaking injury news.
+# We use it to supplement ESPN injuries — if a key player is mentioned
+# in RotoWire news with injury keywords, we flag the team.
+
+ROTOWIRE_FEEDS = {
+    "basketball_nba":       "https://www.rotowire.com/basketball/rss-player-news.php",
+    "americanfootball_nfl": "https://www.rotowire.com/football/rss-player-news.php",
+    "baseball_mlb":         "https://www.rotowire.com/baseball/rss-player-news.php",
+    "icehockey_nhl":        "https://www.rotowire.com/hockey/rss-player-news.php",
+}
+
+INJURY_KEYWORDS = {
+    "out", "ruled out", "questionable", "doubtful", "injured",
+    "illness", "surgery", "fracture", "sprain", "strain",
+    "concussion", "knee", "ankle", "hamstring", "shoulder",
+    "scratched", "did not practice", "limited",
+}
+
+# high-impact position keywords — injuries to these matter more
+HIGH_IMPACT_KEYWORDS = {
+    "basketball_nba":       {"guard", "forward", "center", "star", "all-star"},
+    "americanfootball_nfl": {"quarterback", "qb", "wide receiver", "wr"},
+    "baseball_mlb":         {"starter", "starting pitcher", "ace", "closer"},
+    "icehockey_nhl":        {"goalie", "goaltender", "captain"},
+}
+
+_rotowire_cache = {}
+
+def get_rotowire_injuries(sport):
+    """
+    Fetch RotoWire RSS and extract injured players by team.
+    Returns dict: team_keyword -> injury_severity (0.0 - 1.0)
+    Higher = more significant injury news for that team.
+    """
+    if sport in _rotowire_cache:
+        return _rotowire_cache[sport]
+
+    feed_url = ROTOWIRE_FEEDS.get(sport)
+    if not feed_url:
+        return {}
+
+    cache_key = f"rotowire_{sport}"
+    cached    = cache_get(cache_key)
+    if cached is not None:
+        _rotowire_cache[sport] = cached
+        return cached
+
+    try:
+        import xml.etree.ElementTree as ET
+
+        resp = requests.get(feed_url, timeout=10,
+                           headers={"User-Agent": "EdgeIQ/1.0"})
+        if resp.status_code != 200:
+            _rotowire_cache[sport] = {}
+            return {}
+
+        root     = ET.fromstring(resp.content)
+        channel  = root.find("channel")
+        items    = channel.findall("item") if channel else []
+
+        # parse last 50 items (recent news only)
+        team_impact = {}
+        high_impact = HIGH_IMPACT_KEYWORDS.get(sport, set())
+
+        for item in items[:50]:
+            title = ""
+            desc  = ""
+
+            # handle CDATA sections
+            title_el = item.find("title")
+            desc_el  = item.find("description")
+
+            if title_el is not None and title_el.text:
+                title = title_el.text.lower()
+            if desc_el is not None and desc_el.text:
+                desc = desc_el.text.lower()
+
+            combined = title + " " + desc
+
+            # check for injury keywords
+            injury_found = any(kw in combined for kw in INJURY_KEYWORDS)
+            if not injury_found:
+                continue
+
+            # severity: higher if high-impact position mentioned
+            severity = 0.3
+            if any(kw in combined for kw in high_impact):
+                severity = 0.6
+            if "out" in combined or "ruled out" in combined:
+                severity = min(severity + 0.3, 1.0)
+            if "questionable" in combined or "doubtful" in combined:
+                severity = min(severity + 0.15, 1.0)
+
+            # extract team name — look for capitalized words before injury keyword
+            # RotoWire titles format: "Player Name (Team) - injury news"
+            import re
+            team_match = re.search(r'\(([^)]+)\)', title_el.text if title_el is not None and title_el.text else "")
+            if team_match:
+                team_abbr = team_match.group(1).lower()
+                # accumulate severity per team (multiple injuries compound)
+                team_impact[team_abbr] = min(
+                    team_impact.get(team_abbr, 0) + severity * 0.5, 1.0
+                )
+
+        cache_set(cache_key, team_impact)
+        if team_impact:
+            print(f"  RotoWire {sport}: {len(team_impact)} teams with news")
+        _rotowire_cache[sport] = team_impact
+        return team_impact
+
+    except Exception as e:
+        print(f"  RotoWire error {sport}: {e}")
+        _rotowire_cache[sport] = {}
+        return {}
+
+def get_rotowire_signal(team, sport, rw_injuries):
+    """
+    Convert RotoWire injury news into a signal.
+    0.5 = no news (neutral)
+    Lower = team has injury news (bad for that team)
+    Higher = opponent has injury news (good for this team — handled in score_game)
+    """
+    if not rw_injuries:
+        return 0.5
+
+    team_lower = team.lower()
+    team_words = set(team_lower.split())
+
+    impact = 0.0
+    for abbr, severity in rw_injuries.items():
+        # match team abbreviation to team name
+        if abbr in team_lower or any(abbr in w for w in team_words):
+            impact = max(impact, severity)
+
+    if impact == 0:
+        return 0.5
+
+    # convert impact to signal — higher impact = lower signal for this team
+    signal = max(0.1, 0.5 - impact * 0.4)
+    return round(signal, 3)
+
 
 # ── ESPN injury signal ───────────────────────────────────────────────
 
@@ -1176,7 +1321,7 @@ def expected_value(adj_prob, best_odds):
     implied = american_to_implied_prob(best_odds)
     return round((adj_prob - implied) * 100, 2)
 
-def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_cache, today="", team_form=None):
+def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_cache, today="", team_form=None, rw_injuries=None):
     picks      = []
     bookmakers = game.get("bookmakers", [])
     if not bookmakers:
@@ -1210,7 +1355,8 @@ def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_c
     if not juices:
         return picks
 
-    teams = list(juices.keys())
+    # exclude draw outcomes — model can't predict draws reliably
+    teams = [t for t in juices.keys() if t.lower() != "draw"]
     if len(teams) < 2:
         return picks
 
@@ -1252,6 +1398,9 @@ def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_c
         # injury signal — lower if key players out for this team
         injury_signal = get_injury_signal(team, sport, injuries)
 
+        # RotoWire injury news — supplements ESPN with faster breaking news
+        rw_signal = get_rotowire_signal(team, sport, rw_injuries or {})
+
         # team form — penalize bad teams, reward good teams
         form_signal = get_form_signal(team, sport, team_form or {})
 
@@ -1290,6 +1439,7 @@ def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_c
             team_weather         * WEIGHTS["weather"]       +
             prop_signal          * WEIGHTS["prop_signal"]   +
             injury_signal        * WEIGHTS["injury"]        +
+            rw_signal            * WEIGHTS["rotowire"]       +
             book_disagree_signal * WEIGHTS["book_disagree"] +
             rest_signal          * WEIGHTS["rest_days"]     +
             clv_signal           * WEIGHTS["clv"]           +
@@ -1326,6 +1476,7 @@ def score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_c
                 "weather":       round(team_weather, 3),
                 "prop_signal":   round(prop_signal, 3),
                 "injury":        round(injury_signal, 3),
+                "rotowire":      round(rw_signal, 3),
                 "book_disagree": round(book_disagree_signal, 3),
                 "rest_days":     round(rest_signal, 3),
                 "clv":           round(clv_signal, 3),
@@ -1431,9 +1582,10 @@ def fetch_and_score():
             continue
         print(f"  {len(games)} games found")
 
-        # fetch ESPN injuries and team form for this sport
-        injuries  = get_espn_injuries(sport)
-        team_form = get_team_form(sport)
+        # fetch ESPN injuries, RotoWire news, and team form for this sport
+        injuries    = get_espn_injuries(sport)
+        rw_injuries = get_rotowire_injuries(sport)
+        team_form   = get_team_form(sport)
 
         # ── three-run schedule (all times ET = UTC-4) ──────────────
         # RUN_MODE is set once per session at top of fetch_and_score()
@@ -1468,7 +1620,7 @@ def fetch_and_score():
                     totals_by_id[tg["id"]] = tg
 
         for game in games:
-            all_picks.extend(score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_cache, today, team_form))
+            all_picks.extend(score_game(game, opening_lines, weather_cache, props_cache, injuries, rest_cache, today, team_form, rw_injuries))
             # score totals if available for this game
             if game["id"] in totals_by_id:
                 all_picks.extend(score_totals(totals_by_id[game["id"]], opening_lines, weather_cache))
@@ -1477,8 +1629,26 @@ def fetch_and_score():
         print("\nNo picks with positive EV today.")
         return
 
+    # remove draw picks — draws are too hard to predict reliably
+    all_picks = [p for p in all_picks if "draw" not in p.get("pick_team", "").lower()]
+
     all_picks.sort(key=lambda p: p["ev"], reverse=True)
-    top_picks = all_picks[:MAX_PICKS]
+
+    # filter out big underdogs — model wins only 40% on dogs, need 43%+ to profit
+    # cap at +175 (need 36% win rate) — slightly above our current 40% actual rate
+    all_picks = [p for p in all_picks if p.get("odds", 0) <= 175]
+
+    # deduplicate — remove contradicting picks from same matchup
+    # keep only the higher-EV team from each game
+    seen_matchups = set()
+    deduped_picks = []
+    for pick in all_picks:
+        matchup_key = tuple(sorted([pick["home_team"], pick["away_team"]]))
+        if matchup_key not in seen_matchups:
+            seen_matchups.add(matchup_key)
+            deduped_picks.append(pick)
+
+    top_picks = deduped_picks[:MAX_PICKS]
 
     # pick_date and merge strategy depend on run mode
     if run_mode == "evening":
@@ -1566,6 +1736,7 @@ def fetch_and_score():
             "reverse_line":  "reverse line move",
             "steam_move":    "steam move detected",
             "team_form":     "team quality",
+            "rotowire":      "injury news",
         }
         print(f"  #{rank}  {pick['pick_line']:<35} conf {pick['confidence']}%  EV {pick['ev']:+.1f}  [{labels.get(driver, driver)}]")
 
