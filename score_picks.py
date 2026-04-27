@@ -761,7 +761,7 @@ def get_team_form(sport):
         "americanfootball_nfl":    "football/nfl",
         "baseball_mlb":            "baseball/mlb",
         "icehockey_nhl":           "hockey/nhl",
-        "soccer_usa_mls":          "soccer/usa.1",
+        "soccer_usa_mls":          "soccer/usa.mls",
         "basketball_ncaab":        "basketball/mens-college-basketball",
         "americanfootball_ncaaf":  "football/college-football",
     }
@@ -990,7 +990,7 @@ def get_rest_days(team, sport):
         "americanfootball_nfl":    "football/nfl",
         "baseball_mlb":            "baseball/mlb",
         "icehockey_nhl":           "hockey/nhl",
-        "soccer_usa_mls":          "soccer/usa.1",
+        "soccer_usa_mls":          "soccer/usa.mls",
         "basketball_ncaab":        "basketball/mens-college-basketball",
         "americanfootball_ncaaf":  "football/college-football",
     }
@@ -1507,12 +1507,19 @@ def fetch_and_score():
     if et_hour < 12:        # before noon ET → 8 AM run
         run_mode     = "morning"
         window_start = datetime.now(timezone.utc)
-        window_end   = datetime.now(timezone.utc).replace(hour=23, minute=59, second=59)
+        from datetime import timedelta as _tdt3
+        today_et_m   = (datetime.now(timezone.utc) - _tdt3(hours=4)).date()
+        window_end   = datetime(today_et_m.year, today_et_m.month, today_et_m.day,
+                               23, 59, 59, tzinfo=timezone.utc) + _tdt3(hours=4)
         window_label = "today's upcoming games only"
     elif et_hour < 20:      # noon–8 PM ET → 3 PM run
         run_mode     = "afternoon"
         window_start = datetime.now(timezone.utc)
-        window_end   = datetime.now(timezone.utc).replace(hour=23, minute=59, second=59)
+        # end of day in ET = 4 AM UTC next day (midnight ET + buffer)
+        from datetime import timedelta as _tdt2
+        today_et     = (datetime.now(timezone.utc) - _tdt2(hours=4)).date()
+        window_end   = datetime(today_et.year, today_et.month, today_et.day,
+                               23, 59, 59, tzinfo=timezone.utc) + _tdt2(hours=4)
         window_label = "today's remaining games"
     else:                   # after 8 PM ET → 8 PM run
         run_mode     = "evening"
